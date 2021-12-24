@@ -125,9 +125,9 @@ impl MessageTableRecordTags {
         }
     }
 
-    pub fn append_set_from_udp(set: &mut HashSet<MessageTableRecordTags>, tcp: &UDP) {
-        set.insert(MessageTableRecordTags::TCP);
-        match tcp {
+    pub fn append_set_from_udp(set: &mut HashSet<MessageTableRecordTags>, udp: &UDP) {
+        set.insert(MessageTableRecordTags::UDP);
+        match udp {
             UDP::DHCP(_) => {
                 set.insert(MessageTableRecordTags::DHCP);
             }
