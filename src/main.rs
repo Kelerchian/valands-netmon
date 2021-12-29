@@ -1,4 +1,5 @@
 pub mod centrifuge;
+pub mod compatibility;
 pub mod dns_resolver_actor;
 pub mod nom_http;
 pub mod raw_helper_fns;
@@ -6,14 +7,12 @@ pub mod sniffer_actor;
 pub mod structs;
 use dns_resolver_actor::DNSResolverActor;
 use pktparse::ethernet::MacAddress;
-use pnet::{
-    datalink::{self, NetworkInterface},
-    ipnetwork::IpNetwork,
-};
+use pnet::datalink::{self, NetworkInterface};
 use raw_helper_fns::{collect_ip_address_from_message, extract_for_ether, print_raw};
 use sniffer_actor::SnifferActor;
 use std::{
-    collections::{HashSet, VecDeque},
+    cmp::Ordering,
+    collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     sync::{mpsc, Arc, RwLock},
     time::{self, Duration},
@@ -23,7 +22,14 @@ use structs::{ether::Ether, raw::Raw, tcp::TCP, udp::UDP};
 
 use crate::raw_helper_fns::{extract_for_ip_address, extract_for_mac_address, extract_for_port};
 
-#[derive(Debug)]
+#[derive(Default, Clone)]
+pub struct CompositeAddress {
+    mac: Option<MacAddress>,
+    ip: Option<IpAddr>,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Direction {
     Download,
     Upload,
@@ -33,14 +39,26 @@ pub enum Direction {
 
 impl Direction {
     pub fn determine(
-        ips: &HashSet<IpNetwork>,
-        source_ip: &IpAddr,
-        destination_ip: &IpAddr,
+        local_macs: &Vec<MacAddress>,
+        local_ips: &HashSet<IpAddr>,
+        source_address: &CompositeAddress,
+        destination_address: &CompositeAddress,
     ) -> Self {
-        let source_is_local = ips.iter().any(|ip_network| ip_network.ip() == *source_ip);
-        let destination_is_local = ips
-            .iter()
-            .any(|ip_network| ip_network.ip() == *destination_ip);
+        let source_is_local: bool = {
+            match (&source_address.ip, &source_address.mac) {
+                (Some(ip), _) => local_ips.contains(ip),
+                (_, (Some(mac))) => local_macs.iter().any(|local_mac| local_mac == mac),
+                _ => false,
+            }
+        };
+
+        let destination_is_local: bool = {
+            match (&destination_address.ip, &destination_address.mac) {
+                (Some(ip), _) => local_ips.contains(ip),
+                (_, (Some(mac))) => local_macs.iter().any(|local_mac| local_mac == mac),
+                _ => false,
+            }
+        };
 
         if source_is_local && destination_is_local {
             return Direction::Loop;
@@ -63,26 +81,43 @@ pub struct Message {
 
 fn generate_local_ips_set_from_interfaces(
     network_interfaces: &Vec<NetworkInterface>,
-) -> HashSet<IpNetwork> {
-    let ips_vec = network_interfaces.iter().fold(
+) -> HashSet<IpAddr> {
+    HashSet::from_iter(network_interfaces.iter().fold(
         vec![],
-        |mut vec: Vec<IpNetwork>, interface: &NetworkInterface| {
-            let mut ips = interface.ips.clone();
+        |mut vec: Vec<IpAddr>, interface: &NetworkInterface| {
+            let mut ips = interface
+                .ips
+                .iter()
+                .map(|ip_network| -> IpAddr { ip_network.ip() })
+                .collect();
             vec.append(&mut ips);
             vec
         },
-    );
-    HashSet::from_iter(ips_vec)
+    ))
 }
 
-#[derive(PartialEq, Eq, Hash)]
+fn generate_local_macs_set_from_interfaces(
+    network_interfaces: &Vec<NetworkInterface>,
+) -> Vec<MacAddress> {
+    network_interfaces.iter().fold(
+        vec![],
+        |mut vec: Vec<MacAddress>, interface: &NetworkInterface| {
+            if let Some(mac) = interface.mac {
+                vec.push(compatibility::mac_addr_to_mac_address(&mac));
+            }
+            vec
+        },
+    )
+}
+
+#[derive(PartialEq, Eq, Hash, Clone)]
 pub enum MessageTableRecordTags {
     Ether,
     Tun,
     Sll,
     Arp,
-    IPv4,
-    IPv6,
+    IPv4(u16),
+    IPv6(u16),
     Cjdns,
     TCP,
     UDP,
@@ -155,8 +190,8 @@ impl MessageTableRecordTags {
             Ether::Arp(arp) => {
                 set.insert(MessageTableRecordTags::Arp);
             }
-            Ether::IPv4(_, ipv4) => {
-                set.insert(MessageTableRecordTags::IPv4);
+            Ether::IPv4(header, ipv4) => {
+                set.insert(MessageTableRecordTags::IPv4(header.length));
                 match ipv4 {
                     structs::ipv4::IPv4::TCP(_, tcp) => {
                         MessageTableRecordTags::append_set_from_tcp(set, tcp);
@@ -170,8 +205,8 @@ impl MessageTableRecordTags {
                     structs::ipv4::IPv4::Unknown(_) => {}
                 }
             }
-            Ether::IPv6(_, ipv6) => {
-                set.insert(MessageTableRecordTags::IPv6);
+            Ether::IPv6(header, ipv6) => {
+                set.insert(MessageTableRecordTags::IPv6(header.length));
                 match ipv6 {
                     structs::ipv6::IPv6::TCP(_, tcp) => {
                         MessageTableRecordTags::append_set_from_tcp(set, tcp);
@@ -203,22 +238,20 @@ impl MessageTableRecordTags {
     }
 }
 
-#[derive(Default)]
-struct Address {
-    mac: Option<MacAddress>,
-    ip: Option<IpAddr>,
-    port: Option<u16>,
-}
-
+#[derive(Clone)]
 struct MessageRecord {
-    source: Address,
-    dest: Address,
+    source: CompositeAddress,
+    dest: CompositeAddress,
     direction: Direction,
     tags: HashSet<MessageTableRecordTags>,
 }
 
 impl MessageRecord {
-    pub fn from_raw<'a>(local_ips: &HashSet<IpNetwork>, raw: &Raw) -> MessageRecord {
+    pub fn from_raw<'a>(
+        local_macs: &Vec<MacAddress>,
+        local_ips: &HashSet<IpAddr>,
+        raw: &Raw,
+    ) -> MessageRecord {
         let ether = extract_for_ether(&raw);
 
         let addresses_from_raw = match &ether {
@@ -234,9 +267,9 @@ impl MessageRecord {
             None => None,
         };
 
-        let (source, dest): (Address, Address) = match addresses_from_raw {
+        let (source, dest): (CompositeAddress, CompositeAddress) = match addresses_from_raw {
             Some((mac_addresses, ip_addresses, ports)) => (
-                Address {
+                CompositeAddress {
                     mac: match mac_addresses {
                         Some((source, _)) => Some(source),
                         None => None,
@@ -250,7 +283,7 @@ impl MessageRecord {
                         None => None,
                     },
                 },
-                Address {
+                CompositeAddress {
                     mac: match mac_addresses {
                         Some((_, dest)) => Some(dest),
                         None => None,
@@ -268,12 +301,7 @@ impl MessageRecord {
             None => (Default::default(), Default::default()),
         };
 
-        let direction = match (&source.ip, &dest.ip) {
-            (Some(source_ip), Some(destination_ip)) => {
-                Direction::determine(local_ips, source_ip, destination_ip)
-            }
-            _ => Direction::None,
-        };
+        let direction = Direction::determine(local_macs, local_ips, &source, &dest);
 
         MessageRecord {
             source,
@@ -301,6 +329,17 @@ impl MessageBuckets {
         MessageBuckets {
             bucket: Arc::new(RwLock::new((time::Instant::now(), Default::default()))),
             historical_buckets: Default::default(),
+        }
+    }
+
+    pub fn register(&self, message_record: MessageRecord) -> Result<(), ()> {
+        let bucket_rwlock = &*self.bucket;
+        match bucket_rwlock.write() {
+            Ok(mut current_bucket) => {
+                current_bucket.1.push(message_record);
+                Ok(())
+            }
+            Err(err) => Err(()),
         }
     }
 
@@ -339,7 +378,9 @@ impl MessageBuckets {
 }
 
 struct MessageTableRegulator {
-    local_ips: HashSet<IpNetwork>,
+    local_ips: HashSet<IpAddr>,
+    local_macs: Vec<MacAddress>,
+    local_network_interfaces: Vec<NetworkInterface>,
     rotation_duration: Duration,
     expiry_duration: Duration,
     pub downstream_buckets: Arc<MessageBuckets>,
@@ -350,19 +391,62 @@ impl MessageTableRegulator {
     pub fn new(
         rotation_duration: Duration,
         expiry_duration: Duration,
-        local_ips: HashSet<IpNetwork>,
+        local_network_interfaces: Vec<NetworkInterface>,
     ) -> MessageTableRegulator {
-        MessageTableRegulator {
-            local_ips,
+        let local_macs = generate_local_macs_set_from_interfaces(&local_network_interfaces);
+
+        let mut regulator = MessageTableRegulator {
+            local_ips: generate_local_ips_set_from_interfaces(&local_network_interfaces),
+            local_macs,
+            local_network_interfaces,
             rotation_duration,
             expiry_duration,
             downstream_buckets: Arc::new(MessageBuckets::new()),
             upstream_buckets: Arc::new(MessageBuckets::new()),
-        }
+        };
+
+        regulator
     }
 
-    pub fn register(&self, raw: &Raw) {
-        let message = MessageRecord::from_raw(&self.local_ips, raw);
+    pub fn create_runner(
+        self_arc: &Arc<MessageTableRegulator>,
+    ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+        let rotation_duration = self_arc.rotation_duration;
+        let expiry_duration = self_arc.expiry_duration;
+        let rotator_clone = Arc::clone(self_arc);
+        let expiror_clone = Arc::clone(self_arc);
+
+        let rotator_thread_handle = std::thread::Builder::new()
+            .name("MessageBucketRotator".into())
+            .spawn(move || loop {
+                rotator_clone.rotate().unwrap();
+                std::thread::sleep(rotation_duration);
+            })
+            .unwrap();
+        let expiror_thread_handle = std::thread::Builder::new()
+            .name("MessageBucketExpiror".into())
+            .spawn(move || loop {
+                expiror_clone.expire().unwrap();
+                std::thread::sleep(expiry_duration);
+            })
+            .unwrap();
+
+        (rotator_thread_handle, expiror_thread_handle)
+    }
+
+    pub fn register(&self, raw: &Raw) -> Result<(), ()> {
+        let message_record = MessageRecord::from_raw(&self.local_macs, &self.local_ips, raw);
+        match &message_record.direction {
+            &Direction::Download => {
+                let bucket = &(*self.downstream_buckets);
+                bucket.register(message_record)
+            }
+            &Direction::Upload => {
+                let bucket = &(*self.upstream_buckets);
+                bucket.register(message_record)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn rotate(&self) -> Result<(), ()> {
@@ -375,7 +459,7 @@ impl MessageTableRegulator {
         }
     }
 
-    fn clean(&self) -> Result<(), ()> {
+    fn expire(&self) -> Result<(), ()> {
         let expiry_time = time::Instant::now() - self.expiry_duration;
         let res_upstream = self.upstream_buckets.clean_older_than(&expiry_time);
         let res_downstream = self.downstream_buckets.clean_older_than(&expiry_time);
@@ -389,23 +473,21 @@ impl MessageTableRegulator {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (message_sender, message_receiver) = mpsc::channel::<Raw>();
-    let network_interfaces = datalink::interfaces();
+    let local_network_interfaces = datalink::interfaces();
 
-    let local_ips_set = generate_local_ips_set_from_interfaces(&network_interfaces);
-
-    let sniffer_actor = SnifferActor::new(&network_interfaces, &message_sender);
+    let sniffer_actor = SnifferActor::new(&local_network_interfaces, &message_sender);
     let message_table_regulator = Arc::new(MessageTableRegulator::new(
         Duration::from_millis(100),
         Duration::from_millis(5000),
-        local_ips_set.clone(),
+        local_network_interfaces.clone(),
     ));
     let dns_resolver: DNSResolverActor = Default::default();
-    let dns_resolver_store = Arc::clone(&dns_resolver.store);
     let message_hub_thread = {
+        let dns_resolver_store = Arc::clone(&dns_resolver.store);
+        let message_table_regulator = Arc::clone(&message_table_regulator);
         std::thread::Builder::new()
             .name(String::from("message_hub"))
             .spawn(move || loop {
-                let message_table_regulator = Arc::clone(&message_table_regulator);
                 let message_res = message_receiver.recv_timeout(Duration::from_millis(10));
                 if let Ok(message) = message_res {
                     // Process IP Adresses
@@ -422,10 +504,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .collect()
                         };
 
-                        message_table_regulator.register(&message);
-
                         if unregistered_ips.len() > 0 {
-                            println!("unregistered_ips {:?}", unregistered_ips);
+                            // println!("unregistered_ips {:?}", unregistered_ips);
                             let dns_resolver_store_write_handle =
                                 &mut dns_resolver_store.write().unwrap();
                             unregistered_ips.iter().for_each(|ip| {
@@ -434,16 +514,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    message_table_regulator.register(&message).unwrap();
+
                     // Process HTTP
-                    {
-                        print_raw(&message);
-                    }
+                    // {
+                    //     print_raw(&message);
+                    // }
                 }
                 std::thread::park_timeout(Duration::from_millis(10));
             })
             .unwrap()
     };
 
+    let (rotator, expiror) = MessageTableRegulator::create_runner(&message_table_regulator);
+    let dns_resolver_store = Arc::clone(&dns_resolver.store);
+
+    loop {
+        for _ in [1..10] {
+            println!("");
+        }
+        let downstream_data = {
+            let downstream_read = &message_table_regulator
+                .downstream_buckets
+                .historical_buckets
+                .read()
+                .unwrap();
+            downstream_read.iter().fold::<Vec<Vec<MessageRecord>>, _>(
+                vec![],
+                |mut accumulator, item| {
+                    let vec_ref = item.1.clone();
+                    accumulator.push(vec_ref);
+                    accumulator
+                },
+            )
+        };
+
+        let mut ip_payload_map = downstream_data.iter().fold(
+            HashMap::<&IpAddr, u16>::new(),
+            |mut ip_payload_map, vec| {
+                vec.iter().for_each(|item| match &item.source.ip {
+                    Some(ip) => {
+                        ip_payload_map.insert(ip, {
+                            let mut sum: u16 = match ip_payload_map.get(ip) {
+                                Some(val) => *val,
+                                None => 0_u16.into(),
+                            };
+                            sum += item.tags.iter().fold(0, |sum, tag| match tag {
+                                MessageTableRecordTags::IPv4(header_length) => *header_length,
+                                MessageTableRecordTags::IPv6(header_length) => *header_length,
+                                _ => 0,
+                            });
+                            sum
+                        });
+                    }
+                    None => {}
+                });
+                ip_payload_map
+            },
+        );
+
+        let mut ip_payload_vec: Vec<_> = ip_payload_map.into_iter().collect();
+        ip_payload_vec.sort_by(|(ip_a, size_a), (ip_b, size_b)| match true {
+            _ if size_a < size_b => Ordering::Greater,
+            _ if size_a > size_b => Ordering::Less,
+            _ => match true {
+                _ if ip_a < ip_b => Ordering::Greater,
+                _ if ip_a > ip_b => Ordering::Less,
+                _ => Ordering::Equal,
+            },
+        });
+
+        let dns_resolver_store = dns_resolver_store.read().unwrap();
+
+        ip_payload_vec.iter().for_each(|(ip, size)| {
+            let default: &String = &String::from("unknown");
+            let name: &String = match dns_resolver_store.get(ip) {
+                Some(name) => name,
+                None => default,
+            };
+            println!("{} ({}): {}", ip, name, size);
+        });
+
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+
+    rotator.join().unwrap();
+    expiror.join().unwrap();
     dns_resolver.join().unwrap();
     sniffer_actor.join().unwrap();
     message_hub_thread.join().unwrap();

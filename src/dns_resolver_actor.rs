@@ -1,5 +1,4 @@
 use std::{
-    any::Any,
     cell::RefCell,
     collections::HashMap,
     net::IpAddr,
@@ -11,8 +10,6 @@ use trust_dns_resolver::{
     config::{ResolverConfig, ResolverOpts},
     Resolver,
 };
-
-use crate::structs::dns::DNS;
 
 pub struct DNSResolverActor {
     pub store: Arc<RwLock<DNSResolverStore>>,
@@ -63,7 +60,7 @@ impl Default for DNSResolverActor {
 
                 let mut dns_resolver_store = store_rwlock_arc.write().unwrap();
                 resolved_ips.iter().for_each(|(ip_address_ref, hostname)| {
-                    println!("resolved: {} -> {}", ip_address_ref, hostname);
+                    // println!("resolved: {} -> {}", ip_address_ref, hostname);
                     dns_resolver_store.insert(ip_address_ref, hostname.clone());
                 });
 
@@ -116,6 +113,16 @@ impl DNSResolverStore {
 
     pub fn insert(&mut self, ip_address_ref: &IpAddr, hostname: String) -> Option<Option<String>> {
         self.map.insert(*ip_address_ref, Some(hostname))
+    }
+
+    pub fn get(&self, ip_address_ref: &IpAddr) -> Option<&String> {
+        match self.map.get(ip_address_ref) {
+            Some(container) => match container {
+                Some(name) => Some(name),
+                _ => None,
+            },
+            None => None,
+        }
     }
 
     pub fn get_unresolved_ips(&self) -> Vec<IpAddr> {
