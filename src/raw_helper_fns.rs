@@ -2,21 +2,11 @@ use std::net::IpAddr;
 
 use pktparse::{
     ethernet::{EthernetFrame, MacAddress},
-    ipv4::IPv4Header,
-    ipv6::IPv6Header,
     tcp::TcpHeader,
     udp::UdpHeader,
 };
 
-use crate::structs::{
-    self,
-    ether::Ether,
-    ipv4::IPv4,
-    ipv6::IPv6,
-    raw::Raw,
-    tcp::{self, TCP},
-    udp::UDP,
-};
+use crate::structs::{self, ether::Ether, ipv4::IPv4, ipv6::IPv6, raw::Raw, tcp::TCP, udp::UDP};
 
 pub fn collect_ip_address_from_ether(ips: &mut Vec<IpAddr>, ether: &Ether) {
     use structs::arp::ARP;
@@ -31,6 +21,7 @@ pub fn collect_ip_address_from_ether(ips: &mut Vec<IpAddr>, ether: &Ether) {
                 ips.push(IpAddr::V4(arp_packet.src_addr));
             }
         },
+
         Ether::IPv4(header, _) => {
             ips.push(IpAddr::V4(header.source_addr));
             ips.push(IpAddr::V4(header.dest_addr));
