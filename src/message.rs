@@ -8,7 +8,7 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct CompositeAddress {
     pub mac: Option<MacAddress>,
     pub ip: Option<IpAddr>,
@@ -16,7 +16,7 @@ pub struct CompositeAddress {
     pub socket_address: Option<SocketAddr>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Direction {
     Download,
     Upload,
@@ -31,6 +31,7 @@ impl Direction {
         source_address: &CompositeAddress,
         destination_address: &CompositeAddress,
     ) -> Self {
+        // TODO: make mac_address hashable
         let source_is_local: bool = {
             match (&source_address.ip, &source_address.mac) {
                 (Some(ip), _) => local_ips.contains(ip),
@@ -42,7 +43,7 @@ impl Direction {
         let destination_is_local: bool = {
             match (&destination_address.ip, &destination_address.mac) {
                 (Some(ip), _) => local_ips.contains(ip),
-                (_, (Some(mac))) => local_macs.iter().any(|local_mac| local_mac == mac),
+                (_, Some(mac)) => local_macs.iter().any(|local_mac| local_mac == mac),
                 _ => false,
             }
         };
@@ -61,7 +62,7 @@ impl Direction {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone)]
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub enum MessageTableRecordTags {
     Ether,
     Tun,
@@ -74,7 +75,7 @@ pub enum MessageTableRecordTags {
     UDP { dest_port: u16, source_port: u16 },
     ICMP,
     TLS,
-    HTTP,
+    HTTP { uri: String, host: Option<String> },
     Text,
     Binary,
     DHCP,
@@ -107,8 +108,8 @@ impl MessageTableRecordTags {
             TCP::TLS(_) => {
                 set.insert(MessageTableRecordTags::TLS);
             }
-            TCP::HTTP(_) => {
-                set.insert(MessageTableRecordTags::HTTP);
+            TCP::HTTP(req) => {
+                set.insert(MessageTableRecordTags::HTTP { uri: req.uri.clone(), host: req.host.clone() });
             }
             TCP::Text(text) => {
                 MessageTableRecordTags::append_set_from_text(set, text);

@@ -1,117 +1,224 @@
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+use crate::{
+    actors::dns_resolver_actor::DNSResolverStore,
+    message::{Direction, MessageRecord, MessageTableRecordTags},
+    MessageTableRegulator,
 };
+use eframe::{egui, epi};
 use std::{
-    io::{self, ErrorKind},
-    time::Instant,
-};
-use std::{
-    sync::{Arc, Mutex},
+    cmp::Ordering,
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, RwLock},
     time::Duration,
 };
-use tui::Terminal;
-use tui::{backend::CrosstermBackend, widgets::canvas::Canvas};
-use tui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::Color,
-    widgets::canvas::{Map, MapResolution},
-};
-use tui::{
-    style::Style,
-    text::Span,
-    widgets::{Block, Borders},
-};
 
-pub enum UIState {
-    CounterExample(u8),
+struct Data {
+    downstream: Vec<Vec<MessageRecord>>,
+    upstream: Vec<Vec<MessageRecord>>,
 }
 
-pub fn run_ui() -> Result<(), std::io::Error> {
-    let stdout = io::stdout();
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let tick_rate = Duration::from_millis(50);
-    let mut last_tick = Instant::now();
-    let mut ui_state: Arc<Mutex<UIState>> = Arc::new(Mutex::new(UIState::CounterExample(0)));
+pub struct UIState {
+    is_active: Arc<RwLock<bool>>,
+    dns_resolver_store: Arc<RwLock<DNSResolverStore>>,
+    direction: Arc<RwLock<Direction>>,
+    data: Arc<RwLock<Option<Data>>>,
+}
 
-    terminal.clear()?;
-    loop {
-        terminal.draw(|f| {
-            let ui_state = match ui_state.lock() {
-                Ok(mut ui_state) => {
-                    let chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .margin(1)
-                        .constraints(
-                            [
-                                Constraint::Length(3),
-                                Constraint::Percentage(80),
-                                Constraint::Percentage(10),
-                            ]
-                            .as_ref(),
-                        )
-                        .split(f.size());
-                    let block = Block::default()
-                        .title(match *ui_state {
-                            UIState::CounterExample(x) => format!("{}", x),
-                        })
-                        .borders(Borders::ALL);
-                    let canvas = Canvas::default().block(Block::default()).paint(|ctx| {
-                        ctx.draw(&Map {
-                            color: Color::White,
-                            resolution: MapResolution::High,
-                        });
-                        ctx.print(1_f64, 1_f64, "you are here", Color::Yellow);
-                    });
-                    let area = block.inner(f.size());
-                    f.render_widget(block, area);
-                    f.render_widget(canvas, chunks[0]);
-                    let block = Block::default().title("Block 2").borders(Borders::ALL);
-                    f.render_widget(block, chunks[1]);
-                }
-                Err(_) => {}
-            };
-        })?;
-
-        let polled_event_option = if event::poll(
-            tick_rate
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or(Duration::from_millis(0)),
-        )? {
-            Some(event::read()?)
-        } else {
-            None
-        };
-
-        if last_tick.elapsed() < tick_rate {
-            std::thread::sleep(
-                tick_rate
-                    .checked_sub(last_tick.elapsed())
-                    .unwrap_or(Duration::from_millis(0)),
-            );
-            last_tick = Instant::now()
-        }
-
-        if let Some(event) = polled_event_option {
-            match event {
-                CEvent::Key(key) => match key.code {
-                    KeyCode::F(1) => {}
-                    KeyCode::F(2) => match ui_state.lock() {
-                        Ok(mut ui_state) => match *ui_state {
-                            UIState::CounterExample(x) => {
-                                *ui_state = UIState::CounterExample(x + 1);
-                            }
-                        },
-                        Err(_) => return Err(std::io::Error::from(ErrorKind::Other)),
-                    },
-                    _ => {}
-                },
-                CEvent::Mouse(_) => {}
-                CEvent::Resize(_, _) => {}
-            }
+impl UIState {
+    fn new(dns_resolver_store: &Arc<RwLock<DNSResolverStore>>) -> Self {
+        Self {
+            dns_resolver_store: Arc::clone(dns_resolver_store),
+            is_active: Arc::new(RwLock::new(true)),
+            direction: Arc::new(RwLock::new(Direction::Download)),
+            data: Default::default(),
         }
     }
-    Ok(())
+}
+
+impl Clone for UIState {
+    fn clone(&self) -> Self {
+        Self {
+            is_active: self.is_active.clone(),
+            dns_resolver_store: self.dns_resolver_store.clone(),
+            direction: self.direction.clone(),
+            data: self.data.clone(),
+        }
+    }
+}
+
+struct AppState {
+    state: UIState,
+}
+
+impl AppState {
+    fn new(dns_resolver_store: &Arc<RwLock<DNSResolverStore>>) -> Self {
+        Self {
+            state: UIState::new(dns_resolver_store),
+        }
+    }
+}
+
+impl epi::App for AppState {
+    fn name(&self) -> &str {
+        "Valands Netmon"
+    }
+
+    fn update(&mut self, ctx: &egui::CtxRef, frame: &epi::Frame) {
+        if let Ok(mut direction) = self.state.direction.write() {
+            if let Ok(data) = self.state.data.read() {
+                if let Some(data) = &*data {
+
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.vertical(|ui| {
+                            ui.radio_value(&mut *direction, Direction::Download, "Downstream");
+                            ui.radio_value(&mut *direction, Direction::Upload, "Upstream");
+                        });
+                        egui::Grid::new("thegrid").show(ui, |ui| {
+                            let data = {
+                                match *direction {
+                                    Direction::Upload => &data.upstream,
+                                    _ => &data.downstream
+                                }
+                            };
+                            data.iter().for_each(|data| {
+                                data.iter().for_each(|data|{
+                                    ui.label(format!("dest:{:?}", &data.dest));
+                                    ui.label(format!("source:{:?}", &data.source));
+                                    ui.label(format!("tags:{:?}", &data.tags));
+                                    ui.end_row();
+                                });
+                            });
+                        });
+                    });
+                }
+            }
+
+        }
+    }
+}
+
+pub fn run_worker(
+    ui_state: &UIState,
+    message_table_regulator: Arc<MessageTableRegulator>,
+    dns_resolver_store: Arc<RwLock<DNSResolverStore>>,
+) -> std::thread::JoinHandle<()> {
+    let is_active_arc = Arc::clone(&ui_state.is_active);
+    let data = Arc::clone(&ui_state.data);
+    let dns_resolver_store = Arc::clone(&dns_resolver_store);
+    std::thread::Builder::new()
+        .name(String::from("UI worker"))
+        .spawn(move || loop {
+            if {
+                let is_active = *is_active_arc.read().unwrap();
+                !is_active
+            } {
+                break;
+            };
+
+            let upstream_data = {
+                let upstream_read = &message_table_regulator
+                    .upstream_buckets
+                    .historical_buckets
+                    .read()
+                    .unwrap();
+                upstream_read.iter().fold::<Vec<Vec<MessageRecord>>, _>(
+                    vec![],
+                    |mut accumulator, item| {
+                        let vec_ref = item.1.clone();
+                        accumulator.push(vec_ref);
+                        accumulator
+                    },
+                )
+            };
+
+            let downstream_data = {
+                let downstream_read = &message_table_regulator
+                    .downstream_buckets
+                    .historical_buckets
+                    .read()
+                    .unwrap();
+                downstream_read.iter().fold::<Vec<Vec<MessageRecord>>, _>(
+                    vec![],
+                    |mut accumulator, item| {
+                        let vec_ref = item.1.clone();
+                        accumulator.push(vec_ref);
+                        accumulator
+                    },
+                )
+            };
+
+            let mut ip_payload_map = downstream_data.iter().fold(
+                HashMap::<&IpAddr, u64>::new(),
+                |mut ip_payload_map, vec| {
+                    vec.iter().for_each(|item| match &item.source.ip {
+                        Some(ip) => {
+                            ip_payload_map.insert(ip, {
+                                let mut sum: u64 = match ip_payload_map.get(ip) {
+                                    Some(val) => *val,
+                                    None => 0_u16.into(),
+                                };
+                                let current: u64 = item.tags.iter().fold(0, |sum, tag| match tag {
+                                    MessageTableRecordTags::IPv4(header_length) => *header_length,
+                                    MessageTableRecordTags::IPv6(header_length) => *header_length,
+                                    _ => 0,
+                                }) as u64;
+
+                                sum += current;
+                                sum
+                            });
+                        }
+                        None => {}
+                    });
+                    ip_payload_map
+                },
+            );
+
+            let mut ip_payload_vec: Vec<_> = ip_payload_map.into_iter().collect();
+            ip_payload_vec.sort_by(|(ip_a, size_a), (ip_b, size_b)| match true {
+                _ if size_a < size_b => Ordering::Greater,
+                _ if size_a > size_b => Ordering::Less,
+                _ => match true {
+                    _ if ip_a < ip_b => Ordering::Greater,
+                    _ if ip_a > ip_b => Ordering::Less,
+                    _ => Ordering::Equal,
+                },
+            });
+
+            let dns_resolver_store = dns_resolver_store.read().unwrap();
+
+            ip_payload_vec.iter().for_each(|(ip, size)| {
+                let default: &String = &String::from("unknown");
+                let name: &String = match dns_resolver_store.get(ip) {
+                    Some(name) => name,
+                    None => default,
+                };
+                println!("{} ({}): {}", ip, name, size);
+            });
+
+            if let Ok(mut write) = data.write() {
+                *write = Some(Data {
+                    upstream: upstream_data,
+                    downstream: downstream_data,
+                });
+            }
+
+            std::thread::sleep(Duration::from_millis(1000));
+        })
+        .unwrap()
+}
+
+pub fn run_ui(
+    message_table_regulator: Arc<MessageTableRegulator>,
+    dns_resolver_store: Arc<RwLock<DNSResolverStore>>,
+) {
+    let ui_config = UIState::new(&dns_resolver_store);
+    let app = AppState {
+        state: ui_config.clone(),
+    };
+    let native_options = eframe::NativeOptions::default();
+    let worker_thread = run_worker(&ui_config, message_table_regulator, dns_resolver_store);
+
+    eframe::run_native(Box::new(app), native_options);
+
+    worker_thread.join().unwrap();
 }
